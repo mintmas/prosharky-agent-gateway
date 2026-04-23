@@ -11,6 +11,9 @@ Endpoints:
   /v1/chat/completions    — LiteLLM pass-through (free tier, small markup later)
   /v1/swap/quote          — 0x swap quote w/ our swapFeeBps=50 pre-baked
   /v1/bridge/quote        — LI.FI bridge quote w/ integrator=prosharky
+  /v1/mayan/quote         — Mayan cross-chain swap quote w/ referrerBps=50
+  /v1/kyber/quote         — KyberSwap aggregator route w/ feeReceiver
+  /v1/relay/quote         — Relay bridge+swap quote w/ appFees=50 bps
   /v1/paymaster/top       — [PAID $0.05] top ERC-4337 paymasters by revenue
   /v1/mempool/middleware  — [PAID $0.02] live middleware tx stream
   /v1/recurring_bots      — [PAID $0.10] recurring bot leaderboard, 24h
@@ -42,6 +45,9 @@ LIFI_INTEGRATOR    = os.environ.get("LIFI_INTEGRATOR", "prosharky")
 RANGO_AFFILIATE    = os.environ.get("RANGO_AFFILIATE_REF", "prosharky")
 SWAP_FEE_BPS       = int(os.environ.get("SWAP_FEE_BPS", "50"))
 BRIDGE_FEE_BPS     = int(os.environ.get("BRIDGE_FEE_BPS", "50"))
+MAYAN_REFERRER_BPS = int(os.environ.get("MAYAN_REFERRER_BPS", "50"))
+KYBER_FEE_BPS      = int(os.environ.get("KYBER_FEE_BPS", "50"))
+RELAY_APP_FEE_BPS  = int(os.environ.get("RELAY_APP_FEE_BPS", "50"))
 FINDINGS_DB        = os.environ.get("FINDINGS_DB", "/opt/wave17_swarm/findings.db")
 
 # x402 facilitator (our own)
@@ -236,6 +242,153 @@ async def bridge_quote(
 
 
 # ---------------------------------------------------------------------------
+# FREE: Mayan Finance cross-chain swap — referrer + referrerBps pre-injected
+# ---------------------------------------------------------------------------
+@app.get("/v1/mayan/quote")
+async def mayan_quote(
+    fromChain: str = "ethereum",
+    toChain: str = "solana",
+    fromToken: str = "",
+    toToken: str = "",
+    amount: str = "",
+    slippageBps: int = 300,
+):
+    """
+    Mayan Finance cross-chain quote (EVM<->SOL<->SUI etc).
+    referrerBps + referrer forcibly set -> fee accrues to our collector on each fill.
+    No registration required, parameter-only integration.
+    """
+    if not (fromToken and toToken and amount):
+        raise HTTPException(status_code=400, detail="fromToken/toToken/amount required")
+
+    # Mayan wants amountIn as NUMBER (float), not string and not wei.
+    try:
+        amount_num = float(amount)
+    except Exception:
+        raise HTTPException(status_code=400, detail="amount must be numeric (human units, not wei)")
+
+    params = {
+        "fromChain": fromChain,
+        "toChain": toChain,
+        "fromToken": fromToken,
+        "toToken": toToken,
+        "amountIn": amount_num,
+        "slippageBps": slippageBps,
+        "referrer": FEE_RECIPIENT_EVM,
+        "referrerBps": MAYAN_REFERRER_BPS,
+        "solanaReferrerAddress": FEE_RECIPIENT_SOL,
+    }
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.get("https://price-api.mayan.finance/v3/quote", params=params)
+    try:
+        data = r.json()
+    except Exception:
+        data = {"error": r.text[:500], "status": r.status_code}
+    if isinstance(data, dict):
+        data["_prosharky"] = {
+            "referrerBps": MAYAN_REFERRER_BPS,
+            "referrer_evm": FEE_RECIPIENT_EVM,
+            "referrer_sol": FEE_RECIPIENT_SOL,
+        }
+    return data
+
+
+# ---------------------------------------------------------------------------
+# FREE: KyberSwap aggregator route — feeReceiver + chargeFeeBy + feeAmount pre-injected
+# ---------------------------------------------------------------------------
+_KYBER_CHAIN_MAP = {
+    1: "ethereum", 8453: "base", 42161: "arbitrum", 10: "optimism",
+    137: "polygon", 56: "bsc", 43114: "avalanche", 250: "fantom",
+    324: "zksync", 59144: "linea", 534352: "scroll", 5000: "mantle",
+    81457: "blast", 1101: "polygon-zkevm",
+}
+
+
+@app.get("/v1/kyber/quote")
+async def kyber_quote(
+    chainId: int = 8453,
+    tokenIn: str = "",
+    tokenOut: str = "",
+    amountIn: str = "",
+):
+    """
+    KyberSwap aggregator route with our feeReceiver + 50 bps chargeFeeBy=currency_out.
+    feeAmount is bps here (KyberSwap accepts bps when isInBps=true).
+    """
+    if not (tokenIn and tokenOut and amountIn):
+        raise HTTPException(status_code=400, detail="tokenIn/tokenOut/amountIn required")
+    chain_slug = _KYBER_CHAIN_MAP.get(chainId, "base")
+
+    params = {
+        "tokenIn": tokenIn,
+        "tokenOut": tokenOut,
+        "amountIn": amountIn,
+        "feeAmount": KYBER_FEE_BPS,
+        "chargeFeeBy": "currency_out",
+        "feeReceiver": FEE_RECIPIENT_EVM,
+        "isInBps": "true",
+        "source": "prosharky",
+    }
+    url = f"https://aggregator-api.kyberswap.com/{chain_slug}/api/v1/routes"
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.get(url, params=params,
+                             headers={"x-client-id": "prosharky"})
+    try:
+        data = r.json()
+    except Exception:
+        data = {"error": r.text[:500], "status": r.status_code}
+    if isinstance(data, dict):
+        data["_prosharky"] = {
+            "feeBps": KYBER_FEE_BPS,
+            "feeReceiver": FEE_RECIPIENT_EVM,
+            "chargeFeeBy": "currency_out",
+            "chain": chain_slug,
+        }
+    return data
+
+
+# ---------------------------------------------------------------------------
+# FREE: Relay bridge+swap quote — appFees pre-injected
+# ---------------------------------------------------------------------------
+@app.post("/v1/relay/quote")
+async def relay_quote(request: Request):
+    """
+    Relay bridge/swap quote with appFees forcibly set to our collector at 50 bps.
+    Relay accepts appFees: [{recipient, fee_bps}] — we pre-inject ours regardless of caller body.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    # Force-inject our fee
+    body["appFees"] = [{
+        "recipient": FEE_RECIPIENT_EVM,
+        "fee": str(RELAY_APP_FEE_BPS),  # Relay expects string bps
+    }]
+    # Safe defaults
+    body.setdefault("tradeType", "EXACT_INPUT")
+    body.setdefault("source", "prosharky")
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(
+            "https://api.relay.link/quote",
+            json=body,
+            headers={"Content-Type": "application/json"},
+        )
+    try:
+        data = r.json()
+    except Exception:
+        data = {"error": r.text[:500], "status": r.status_code}
+    if isinstance(data, dict):
+        data["_prosharky"] = {
+            "appFeeBps": RELAY_APP_FEE_BPS,
+            "recipient": FEE_RECIPIENT_EVM,
+        }
+    return data
+
+
+# ---------------------------------------------------------------------------
 # PAID (x402): paymaster revenue leaderboard
 # ---------------------------------------------------------------------------
 @app.get("/v1/paymaster/top")
@@ -329,6 +482,9 @@ async def llms_txt(request: Request):
 - GET  {base}/v1/models             — list available models
 - GET  {base}/v1/swap/quote         — 0x v2 swap quote (all EVM chains; 50bps integrator fee baked in)
 - GET  {base}/v1/bridge/quote       — LI.FI bridge quote (integrator=prosharky; 50bps)
+- GET  {base}/v1/mayan/quote        — Mayan cross-chain (EVM/SOL/SUI) quote (referrerBps=50)
+- GET  {base}/v1/kyber/quote        — KyberSwap aggregator route (feeReceiver; 50bps currency_out)
+- POST {base}/v1/relay/quote        — Relay bridge+swap quote (appFees=50bps forced-inject)
 
 ### Paid (x402 USDC on Base — pay per call)
 - GET  {base}/v1/paymaster/top?chain=base           — $0.05 — live ERC-4337 paymaster revenue leaderboard
@@ -390,6 +546,9 @@ async def mcp_manifest():
             {"name": "chat_completion", "path": "/v1/chat/completions", "free": True},
             {"name": "swap_quote_0x", "path": "/v1/swap/quote", "free": True},
             {"name": "bridge_quote_lifi", "path": "/v1/bridge/quote", "free": True},
+            {"name": "mayan_quote", "path": "/v1/mayan/quote", "free": True},
+            {"name": "kyber_quote", "path": "/v1/kyber/quote", "free": True},
+            {"name": "relay_quote", "path": "/v1/relay/quote", "free": True, "method": "POST"},
             {"name": "paymaster_top", "path": "/v1/paymaster/top", "price_usdc": 0.05},
             {"name": "mempool_middleware", "path": "/v1/mempool/middleware", "price_usdc": 0.02},
             {"name": "recurring_bots", "path": "/v1/recurring_bots", "price_usdc": 0.10},
