@@ -1,0 +1,34 @@
+version: 1
+name: prosharky-agent-gateway
+displayName: Prosharky Agent Gateway
+description: |
+  Unified swap/bridge/LLM gateway for autonomous agents. Live ERC-4337 paymaster observability.
+  Integrator-fee routing pre-baked into every 0x / LI.FI quote. x402 USDC billing on Base.
+keywords:
+  - mcp
+  - x402
+  - defi
+  - base
+  - ethereum
+  - agent
+  - swap
+  - bridge
+  - llm
+  - paymaster
+  - erc-4337
+  - mev
+  - middleware
+author: insayder
+homepage: https://prosharky-gw.173-249-14-219.sslip.io/llms.txt
+license: MIT
+transport:
+  type: http
+  baseUrl: https://prosharky-gw.173-249-14-219.sslip.io
+  manifest: /mcp/manifest
+capabilities:
+  tools: true
+billing:
+  protocol: x402
+  network: base
+  asset: USDC
+  recipient: "0x5f9B8f3BD13e5320eF5EFAEa906442Fb9B64802c"
